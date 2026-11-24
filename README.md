@@ -1,8 +1,7 @@
 # socialK — CipherPost
 
 Private end-to-end encrypted microblog. Posts are signed (Ed25519 + Schnorr), circle posts and DMs are
-encrypted (X25519 + XChaCha20-Poly1305), and sync happens over Nostr relays, cross-tab BroadcastChannel,
-and WebRTC P2P.
+encrypted (X25519 + XChaCha20-Poly1305), and sync happens over Nostr relays and cross-tab BroadcastChannel.
 
 One codebase ships as:
 

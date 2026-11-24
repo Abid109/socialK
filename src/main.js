@@ -292,10 +292,10 @@ const state = {
   activeDmPeerPkX: null, unreadDms: 0,
   visitedProfilePkSecp: null, profileTab: 'posts', connectionsOwnerPkSecp: null, connectionsModalTab: 'following',
   relays: [], peers: new Map(), circles: new Map(), posts: new Map(), likes: new Map(), likeMeta: new Map(), dms: new Map(),
+  vaultKey: null, vaultMeta: null, legacyIdentity: null,
   following: new Set(), followers: new Set(), followingUpdatedAt: 0, peerFollowing: new Map(),
   deletedPostIds: new Set(), deletedPostAuthors: new Map(), postEdits: new Map(),
-  seenEventIds: new Set(), eventSources: new Map(), processedSignals: new Set(),
-  rtcPeers: new Map(), pendingManualPc: null
+  seenEventIds: new Set(), eventSources: new Map(), processedSignals: new Set()
 };
 
 const openDb = () => new Promise((res, rej) => {
@@ -314,11 +314,42 @@ const saveEventToIdb = (ev) => { try { state.db?.transaction('events', 'readwrit
 const deleteEventFromIdb = (id) => { try { state.db?.transaction('events', 'readwrite').objectStore('events').delete(id); } catch {} };
 const loadAllEventsFromIdb = () => new Promise((res) => { const r = state.db.transaction('events', 'readonly').objectStore('events').getAll(); r.onsuccess = () => res(r.result || []); r.onerror = () => res([]); });
 
+/* --- ACCOUNT VAULT: identity + circle keys are encrypted at rest with the user's passphrase --- */
+const VAULT_KDF = { t: 2, m: 16384, p: 1 };
+const deriveVaultKey = (pass, saltB64) => argon2idAsync(utf8ToBytes(pass), b64UrlToBytes(saltB64), { ...VAULT_KDF, dkLen: 32 });
+async function kvSetSecure(k, v) {
+  const e = encryptXChaCha(state.vaultKey, utf8ToBytes(JSON.stringify(v)), 'cipherpost-vault-v1:' + k);
+  await kvSet(k, { enc: 1, nonce: e.nonce, ct: e.ct });
+}
+async function kvGetSecure(k) {
+  const r = await kvGet(k);
+  if (!r || !r.enc) return null;
+  return JSON.parse(bytesToUtf8(decryptXChaCha(state.vaultKey, r.nonce, r.ct, 'cipherpost-vault-v1:' + k)));
+}
+async function createVault(pass) {
+  const salt = bytesToB64Url(randomBytes(16));
+  state.vaultKey = await deriveVaultKey(pass, salt);
+  state.vaultMeta = { v: 1, salt, check: encryptXChaCha(state.vaultKey, utf8ToBytes('ok'), 'cipherpost-vault-check') };
+}
+async function unlockVault(pass) {
+  const meta = state.vaultMeta;
+  if (!meta) return false;
+  const key = await deriveVaultKey(pass, meta.salt);
+  try {
+    if (bytesToUtf8(decryptXChaCha(key, meta.check.nonce, meta.check.ct, 'cipherpost-vault-check')) !== 'ok') return false;
+  } catch { return false; }
+  state.vaultKey = key;
+  return true;
+}
+
 async function persistState() {
-  await kvSet('identity', state.identity);
+  if (!state.vaultKey) return;
+  state.vaultMeta = { ...state.vaultMeta, name: state.identity.name, handle: state.identity.handle, pkEd: state.identity.pkEd };
+  await kvSet('vaultMeta', state.vaultMeta);
+  await kvSetSecure('identity', state.identity);
   await kvSet('theme', state.theme);
   await kvSet('pcLayout', state.pcLayout);
-  await kvSet('circles', Array.from(state.circles.values()));
+  await kvSetSecure('circles', Array.from(state.circles.values()));
   await kvSet('contacts', Array.from(state.peers.values()).filter(p => p.isContact));
   await kvSet('following', Array.from(state.following));
   await kvSet('followers', Array.from(state.followers));
@@ -422,107 +453,11 @@ function publishEvent(ev) {
   saveEventToIdb(ev);
   const lr = state.relays.find(r => r.isLocal);
   if (lr?.enabled && localChannel) { localChannel.postMessage({ type: 'EVENT', event: ev }); lr.sent++; lr.ok++; }
-  for (const s of state.rtcPeers.values()) {
-    if (s.dc?.readyState === 'open') { try { s.dc.send(JSON.stringify({ type: 'EVENT', event: ev })); s.syncedCount++; } catch {} }
-  }
   const frame = JSON.stringify(['EVENT', ev]);
   for (const r of state.relays) {
     if (!r.isLocal && r.enabled && r.ws?.readyState === WebSocket.OPEN) { try { r.ws.send(frame); r.sent++; } catch { r.err++; } }
   }
-  renderRelayPanels(); renderP2pPanels();
-}
-
-/* --- 5. WEBRTC P2P DATA CHANNELS --- */
-const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-function waitForIceGathering(pc, ms = 1800) {
-  if (pc.iceGatheringState === 'complete') return Promise.resolve();
-  return new Promise((res) => {
-    const t = setTimeout(() => { pc.removeEventListener('icegatheringstatechange', onS); res(); }, ms);
-    function onS() { if (pc.iceGatheringState === 'complete') { clearTimeout(t); pc.removeEventListener('icegatheringstatechange', onS); res(); } }
-    pc.addEventListener('icegatheringstatechange', onS);
-  });
-}
-
-function setupDataChannel(dc, session) {
-  session.dc = dc;
-  dc.onopen = async () => {
-    session.state = 'Connected'; renderP2pPanels();
-    toast(`WebRTC P2P open with ${session.peerName}`, 'ok');
-    dc.send(JSON.stringify({ type: 'HELLO', peer: { pkSecp: state.identity.pkSecp, pkEd: state.identity.pkEd, pkX: state.identity.pkX, name: state.identity.name, handle: state.identity.handle } }));
-    const batch = (await loadAllEventsFromIdb()).slice(-60);
-    if (batch.length) { dc.send(JSON.stringify({ type: 'SYNC_BATCH', events: batch })); session.syncedCount += batch.length; }
-    renderP2pPanels();
-  };
-  dc.onclose = () => { session.state = 'Offline'; renderP2pPanels(); };
-  dc.onmessage = (evt) => {
-    try {
-      const m = JSON.parse(evt.data);
-      if (m.type === 'HELLO' && m.peer) {
-        upsertPeer(m.peer, false);
-        session.peerName = m.peer.name || session.peerName; session.peerPkX = m.peer.pkX || session.peerPkX; session.peerPkSecp = m.peer.pkSecp || session.peerPkSecp;
-        renderP2pPanels(); renderDmPeers(); renderCardsProfileStats();
-      } else if (m.type === 'EVENT' && m.event) { session.syncedCount++; ingestEvent(m.event, `WebRTC P2P (${session.peerName})`); renderP2pPanels(); }
-      else if (m.type === 'SYNC_BATCH' && Array.isArray(m.events)) {
-        m.events.forEach(ev => { session.syncedCount++; ingestEvent(ev, `WebRTC P2P (${session.peerName})`); });
-        renderP2pPanels();
-      }
-    } catch {}
-  };
-}
-
-function createRtcSession(peerName, peerPkX = '', peerPkSecp = '', sessionId = '') {
-  const id = sessionId || bytesToHex(randomBytes(8));
-  const pc = new RTCPeerConnection(RTC_CONFIG);
-  const session = { sessionId: id, peerName: peerName || 'P2P Peer', peerPkX, peerPkSecp, pc, dc: null, state: 'Connecting', iceState: pc.iceConnectionState, syncedCount: 0 };
-  pc.oniceconnectionstatechange = () => {
-    session.iceState = pc.iceConnectionState;
-    if (['failed', 'closed'].includes(pc.iceConnectionState)) session.state = 'Offline';
-    renderP2pPanels();
-  };
-  state.rtcPeers.set(id, session);
-  renderP2pPanels();
-  return session;
-}
-
-async function initiateP2pViaSignaling(peer) {
-  const session = createRtcSession(peer.name, peer.pkX, peer.pkSecp);
-  setupDataChannel(session.pc.createDataChannel('cipherpost-p2p', { ordered: true }), session);
-  await session.pc.setLocalDescription(await session.pc.createOffer());
-  await waitForIceGathering(session.pc);
-  const payload = { v: 1, signalId: session.sessionId, kind: 'offer', sdp: session.pc.localDescription, fromName: state.identity.name, fromHandle: state.identity.handle, fromPkEd: state.identity.pkEd, fromPkX: state.identity.pkX, fromPkSecp: state.identity.pkSecp };
-  const key = derivePairwiseKey(state.identity.skXHex, peer.pkX, 'rtc-signal', 'cipherpost-rtc-v1');
-  const encSig = encryptXChaCha(key, utf8ToBytes(JSON.stringify(payload)), peer.pkSecp);
-  const edSig = signEdPayload({ signalId: session.sessionId, kind: 'offer', nonce: encSig.nonce, ct: encSig.ct });
-  publishEvent(signNostrEvent(30078, JSON.stringify({ senderPkEd: state.identity.pkEd, senderPkX: state.identity.pkX, recipientPkSecp: peer.pkSecp, nonce: encSig.nonce, ct: encSig.ct, edSig }), [['d', `rtc-${session.sessionId}-offer`], ['t', 'cipherpost'], ['cp-type', 'rtc-signal'], ['p', peer.pkSecp]]));
-  toast(`Encrypted WebRTC offer sent to ${peer.name}`, 'ok');
-}
-
-async function handleIncomingRtcSignal(ev, data) {
-  if (Math.abs(Math.floor(Date.now() / 1000) - ev.created_at) > 120 || data.recipientPkSecp !== state.identity.pkSecp) return;
-  const key = derivePairwiseKey(state.identity.skXHex, data.senderPkX, 'rtc-signal', 'cipherpost-rtc-v1');
-  let payload;
-  try { payload = JSON.parse(bytesToUtf8(decryptXChaCha(key, data.nonce, data.ct, state.identity.pkSecp))); } catch { return; }
-  if (!verifyEdPayload({ signalId: payload.signalId, kind: payload.kind, nonce: data.nonce, ct: data.ct }, data.edSig, data.senderPkEd)) return;
-  const sigKey = payload.signalId + ':' + payload.kind;
-  if (state.processedSignals.has(sigKey)) return;
-  state.processedSignals.add(sigKey);
-  upsertPeer({ pkSecp: ev.pubkey, pkEd: data.senderPkEd, pkX: data.senderPkX, name: payload.fromName, handle: payload.fromHandle }, false);
-
-  if (payload.kind === 'offer') {
-    const session = createRtcSession(payload.fromName, data.senderPkX, ev.pubkey, payload.signalId);
-    session.pc.ondatachannel = (e) => setupDataChannel(e.channel, session);
-    await session.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-    await session.pc.setLocalDescription(await session.pc.createAnswer());
-    await waitForIceGathering(session.pc);
-    const ans = { v: 1, signalId: payload.signalId, kind: 'answer', sdp: session.pc.localDescription, fromName: state.identity.name, fromHandle: state.identity.handle, fromPkEd: state.identity.pkEd, fromPkX: state.identity.pkX, fromPkSecp: state.identity.pkSecp };
-    const encAns = encryptXChaCha(key, utf8ToBytes(JSON.stringify(ans)), ev.pubkey);
-    const edSig = signEdPayload({ signalId: payload.signalId, kind: 'answer', nonce: encAns.nonce, ct: encAns.ct });
-    publishEvent(signNostrEvent(30078, JSON.stringify({ senderPkEd: state.identity.pkEd, senderPkX: state.identity.pkX, recipientPkSecp: ev.pubkey, nonce: encAns.nonce, ct: encAns.ct, edSig }), [['d', `rtc-${payload.signalId}-answer`], ['t', 'cipherpost'], ['cp-type', 'rtc-signal'], ['p', ev.pubkey]]));
-    toast(`Accepted WebRTC offer from ${payload.fromName}`, 'ok');
-  } else if (payload.kind === 'answer') {
-    const s = state.rtcPeers.get(payload.signalId);
-    if (s && s.pc.signalingState === 'have-local-offer') await s.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-  }
+  renderRelayPanels(); renderSearchPanels();
 }
 
 /* --- 6. EVENT INGESTION & VERIFICATION --- */
@@ -553,7 +488,7 @@ const buildProfileEvent = () => signNostrEvent(0, JSON.stringify({
 function announceProfileLocal() { const ev = buildProfileEvent(); localChannel?.postMessage({ type: 'EVENT', event: ev }); saveEventToIdb(ev); }
 
 function isKnownOrLocalSource(ev, sourceLabel) {
-  if (sourceLabel === 'Local Device' || sourceLabel.startsWith('Local Relay') || sourceLabel.startsWith('WebRTC P2P')) return true;
+  if (sourceLabel === 'Local Device' || sourceLabel.startsWith('Local Relay')) return true;
   if (ev.pubkey === state.identity.pkSecp) return true;
   if (state.visitedProfilePkSecp && ev.pubkey === state.visitedProfilePkSecp) return true;
   if (state.following.has(ev.pubkey)) return true;
@@ -603,7 +538,7 @@ async function ingestEvent(ev, sourceLabel = 'Unknown') {
         avatarDataUrl: safePic,
         bannerDataUrl: safeBan
       }, false);
-      renderDmPeers(); renderP2pPanels(); renderCardsProfileStats(); renderTimeline();
+      renderDmPeers(); renderSearchPanels(); renderCardsProfileStats(); renderTimeline();
       if (state.view === 'profile') renderVisitedProfile();
     } catch {}
     return;
@@ -632,7 +567,7 @@ async function ingestEvent(ev, sourceLabel = 'Unknown') {
         else state.followers.delete(ev.pubkey);
         await persistState();
       }
-      renderCardsProfileStats(); renderTimeline(); renderDmMessages(); renderP2pPanels();
+      renderCardsProfileStats(); renderTimeline(); renderDmMessages(); renderSearchPanels();
     }
     return;
   }
@@ -716,7 +651,6 @@ async function ingestEvent(ev, sourceLabel = 'Unknown') {
   }
   if (ev.kind === 30078 && cpType) {
     let d; try { d = JSON.parse(ev.content); } catch { return; }
-    if (cpType === 'rtc-signal') { await handleIncomingRtcSignal(ev, d); return; }
     if (cpType === 'post-edit') {
       const { targetId, text, editedAt, pkEd, edSig } = d;
       if (!targetId || typeof text !== 'string' || !Number.isInteger(editedAt)) return;
@@ -832,13 +766,17 @@ async function reprocessLockedCirclePosts(circleId) {
 }
 
 /* --- 7. CIRCLES, KEY WRAPPING & PUBLISHING --- */
-async function createCircle(name) {
+function buildCircle(name) {
   const circleId = bytesToHex(randomBytes(12));
-  state.circles.set(circleId, {
+  return {
     circleId, name: name.trim(), ownerPkSecp: state.identity.pkSecp, ownerPkEd: state.identity.pkEd, ownerPkX: state.identity.pkX,
     epoch: 1, keys: { '1': bytesToHex(randomBytes(32)) },
     members: [{ pkSecp: state.identity.pkSecp, pkEd: state.identity.pkEd, pkX: state.identity.pkX, name: state.identity.name, handle: state.identity.handle }]
-  });
+  };
+}
+async function createCircle(name) {
+  const c = buildCircle(name);
+  state.circles.set(c.circleId, c);
   await persistState(); renderCircles(); renderComposerCircles(); renderCardsProfileStats(); updateNavBadges();
 }
 
@@ -995,7 +933,7 @@ async function toggleFollow(targetPkSecp, peerMeta = null) {
     resubscribeAllRelays();
     toast(`Following ${label}`, 'ok');
   }
-  renderCardsProfileStats(); renderTimeline(); renderDmMessages(); renderP2pPanels();
+  renderCardsProfileStats(); renderTimeline(); renderDmMessages(); renderSearchPanels();
   if (!$('connections-modal').classList.contains('hidden')) renderConnectionsModal();
   if (state.view === 'profile') renderVisitedProfile();
 }
@@ -1079,7 +1017,6 @@ function switchView(v) {
     feed: 'Home',
     circles: 'Private Circles',
     dms: 'Messages',
-    network: 'Relays & P2P',
     profile: 'Profile',
     settings: 'Settings'
   };
@@ -1102,7 +1039,6 @@ function switchView(v) {
   }
   if (v === 'dms' && state.activeDmPeerPkX) { state.unreadDms = 0; updateNavBadges(); }
   if (v === 'profile') renderVisitedProfile();
-  if (v === 'network') { renderRelayPanels(); renderP2pPanels(); }
   if (v === 'circles') renderCircles();
   if (v === 'settings') renderSettingsView();
   window.scrollTo(0, 0);
@@ -1111,7 +1047,6 @@ function switchView(v) {
 function updateNavBadges() {
   $('nav-circles-count').textContent = String(state.circles.size);
   $('nav-dms-count').textContent = String(state.unreadDms);
-  $('nav-relays-count').textContent = String(state.relays.filter(r => r.status === 'Connected').length);
   const cardsDmBadge = $('cards-dms-badge');
   if (cardsDmBadge) {
     cardsDmBadge.textContent = String(state.unreadDms);
@@ -1536,7 +1471,7 @@ function renderDmPeers() {
 function renderDmMessages() {
   const box = $('dm-messages'); box.textContent = '';
   const peer = Array.from(state.peers.values()).find(p => p.pkX === state.activeDmPeerPkX);
-  const input = $('dm-compose-input'), sendBtn = $('dm-send-btn'), p2pBtn = $('dm-connect-p2p-btn'), profBtn = $('dm-view-profile-btn');
+  const input = $('dm-compose-input'), sendBtn = $('dm-send-btn'), profBtn = $('dm-view-profile-btn');
   const nameBtn = $('dm-active-name-btn'), followSlot = $('dm-follow-slot');
   followSlot.textContent = '';
   if (!peer) {
@@ -1544,15 +1479,14 @@ function renderDmMessages() {
     $('dm-active-meta').textContent = 'X25519 + XChaCha20-Poly1305 encrypted thread';
     nameBtn.disabled = true; nameBtn.onclick = null;
     profBtn.classList.add('hidden');
-    input.disabled = true; sendBtn.disabled = true; p2pBtn.classList.add('hidden'); return;
+    input.disabled = true; sendBtn.disabled = true; return;
   }
   $('dm-active-name').textContent = peer.name;
   $('dm-active-meta').textContent = `x25519:${peer.pkX.slice(0, 14)}... · XChaCha20-Poly1305`;
   nameBtn.disabled = false; nameBtn.onclick = () => visitUserProfile(peer.pkSecp);
   profBtn.classList.remove('hidden'); profBtn.onclick = () => visitUserProfile(peer.pkSecp);
   followSlot.appendChild(makeFollowButton(peer.pkSecp, peer, 'sm'));
-  input.disabled = false; sendBtn.disabled = false; p2pBtn.classList.remove('hidden');
-  p2pBtn.onclick = () => initiateP2pViaSignaling(peer);
+  input.disabled = false; sendBtn.disabled = false;
 
   const msgs = state.dms.get(peer.pkX) || [];
   if (!msgs.length) { box.appendChild(el('div', { className: 'm-auto text-center text-xs text-dim max-w-xs', textContent: `No messages with ${peer.name} yet. Each DM uses a fresh 24-byte random nonce.` })); return; }
@@ -1728,57 +1662,6 @@ function renderSearchPanels() {
 
 function renderRelayPanels() {
   updateNavBadges();
-  const net = $('network-relays-list'); if (!net) return; net.textContent = '';
-  for (const r of state.relays) {
-    net.appendChild(el('div', { className: 'p-3 flex flex-wrap items-center justify-between gap-2 surface-panel text-xs' },
-      el('div', { className: 'min-w-0 flex flex-col gap-0.5' },
-        el('div', { className: 'font-mono-code font-medium text-main truncate', textContent: r.isLocal ? 'local://browser-relay (BroadcastChannel + IndexedDB)' : r.url }),
-        el('div', { className: 'text-[11px] text-dim font-mono-code tabular-nums', textContent: `Sent: ${r.sent} · Recv: ${r.recv} · OK: ${r.ok} · Err: ${r.err}` })
-      ),
-      el('div', { className: 'flex items-center gap-2.5 shrink-0' },
-        el('span', { className: 'inline-flex items-center gap-1.5 font-medium', style: { color: statusColor(r.status) } },
-          el('span', { className: 'w-2 h-2 rounded-full', style: { backgroundColor: statusColor(r.status) } }),
-          el('span', { textContent: r.status })
-        ),
-        el('button', { type: 'button', className: 'btn-ghost px-2.5 py-1 rounded-full text-xs', textContent: r.enabled ? 'Disable' : 'Enable', onclick: () => { r.enabled = !r.enabled; connectRelay(r); persistState(); } })
-      )
-    ));
-  }
-}
-
-function renderP2pPanels() {
-  const sessions = Array.from(state.rtcPeers.values());
-  renderSearchPanels();
-  const sessEl = $('network-p2p-sessions');
-  if (sessEl) {
-    sessEl.textContent = '';
-    if (!sessions.length) sessEl.appendChild(el('div', { className: 'p-3 text-xs text-dim surface-panel', textContent: 'No active WebRTC DataChannels.' }));
-    else sessions.forEach(s => sessEl.appendChild(el('div', { className: 'p-3 flex flex-wrap items-center justify-between gap-2 text-xs surface-panel' },
-      el('div', {}, el('div', { className: 'font-semibold text-main', textContent: s.peerName }), el('div', { className: 'text-[11px] text-dim font-mono-code tabular-nums', textContent: `Session ${s.sessionId} · ICE: ${s.iceState} · Synced: ${s.syncedCount}` })),
-      el('div', { className: 'flex items-center gap-2' },
-        el('span', { className: 'font-medium', style: { color: statusColor(s.state) }, textContent: s.state }),
-        el('button', { type: 'button', className: 'btn-ghost px-2.5 py-1 rounded-full text-xs', textContent: 'Close', onclick: () => { try { s.dc?.close(); s.pc.close(); } catch {} state.rtcPeers.delete(s.sessionId); renderP2pPanels(); } })
-      )
-    )));
-  }
-
-  const peers = Array.from(state.peers.values()).filter(p => p.pkX && p.pkSecp !== state.identity.pkSecp);
-  const discEl = $('network-discovered-peers');
-  if (discEl) {
-    discEl.textContent = '';
-    if (!peers.length) discEl.appendChild(el('div', { className: 'p-3 text-xs text-dim surface-panel', textContent: 'No peers discovered yet. Open another tab or add a Contact Card.' }));
-    else peers.forEach(p => discEl.appendChild(el('div', { className: 'p-3 flex flex-wrap items-center justify-between gap-2 text-xs surface-panel' },
-      el('button', {
-        type: 'button',
-        className: 'min-w-0 text-left hover:underline',
-        onclick: () => visitUserProfile(p.pkSecp)
-      }, el('div', { className: 'font-semibold text-main truncate', textContent: `${p.name} (@${p.handle})` }), el('div', { className: 'text-[11px] text-dim font-mono-code truncate', textContent: `x25519:${p.pkX.slice(0, 16)}...` })),
-      el('div', { className: 'flex items-center gap-2 shrink-0' },
-        makeFollowButton(p.pkSecp, p, 'sm'),
-        el('button', { type: 'button', className: 'btn-primary px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap', textContent: 'Connect P2P', onclick: () => initiateP2pViaSignaling(p) })
-      )
-    )));
-  }
 }
 
 /* --- 9. FOLLOW UI, CONNECTIONS, USER PROFILE VIEW, MEDIA LIGHTBOX, PROOF & ABUSE REPORT --- */
@@ -1958,9 +1841,6 @@ function renderVisitedProfile() {
     renderDmMessages();
   };
 
-  const p2pBtn = $('profile-p2p-btn');
-  p2pBtn.classList.toggle('hidden', isSelf || !peer.pkX);
-  p2pBtn.onclick = () => { if (peer.pkX) initiateP2pViaSignaling(peer); };
 
   $('profile-edit-self-btn').classList.toggle('hidden', !isSelf);
   $('profile-edit-self-btn').onclick = openEditProfileModal;
@@ -2411,10 +2291,11 @@ function bindEvents() {
     } catch (err) { toast(err.message, 'err'); }
   };
 
+  $('logout-btn').onclick = () => { window.location.hash = ''; window.location.reload(); };
   $('reset-identity-open-btn').onclick = () => $('reset-modal').classList.remove('hidden');
   $('reset-modal-cancel').onclick = () => $('reset-modal').classList.add('hidden');
   $('reset-modal-confirm').onclick = async () => {
-    state.identity = generateIdentity('Cipher Peer'); state.circles.clear(); state.dms.clear();
+    state.identity = generateIdentity(state.identity.name, state.identity.handle); state.circles.clear(); state.dms.clear();
     state.following.clear(); state.followers.clear(); state.followingUpdatedAt = 0; state.peerFollowing.clear();
     await createCircle('My Private Circle'); await persistState(); renderIdentitySummary(); renderIdentityView(); renderTimeline(); announceProfileLocal();
     $('reset-modal').classList.add('hidden'); toast('Fresh Ed25519 / X25519 / secp256k1 identity generated', 'ok');
@@ -2476,40 +2357,6 @@ function bindEvents() {
     try { publishDm(state.activeDmPeerPkX, t); $('dm-compose-input').value = ''; } catch (err) { toast(err.message, 'err'); }
   };
 
-  $('reconnect-all-relays-btn').onclick = () => { connectAllRelays(); toast('Reconnecting built-in relays...', 'info'); };
-
-  $('webrtc-create-offer-btn').onclick = async () => {
-    const s = createRtcSession('Manual Peer'); state.pendingManualPc = s;
-    setupDataChannel(s.pc.createDataChannel('cipherpost-p2p', { ordered: true }), s);
-    await s.pc.setLocalDescription(await s.pc.createOffer()); await waitForIceGathering(s.pc);
-    const pkt = JSON.stringify({ type: 'offer', sessionId: s.sessionId, name: state.identity.name, pkX: state.identity.pkX, sdp: s.pc.localDescription });
-    $('webrtc-local-sdp').value = pkt; $('webrtc-qr-wrap').classList.remove('hidden');
-    QRCode.toCanvas($('webrtc-qr-canvas'), pkt, { width: 112, margin: 1 }, () => {});
-    toast('WebRTC Offer created', 'ok');
-  };
-  $('webrtc-process-remote-btn').onclick = async () => {
-    const raw = $('webrtc-remote-sdp').value.trim(); if (!raw) return;
-    try {
-      const m = JSON.parse(raw);
-      if (m.type === 'offer') {
-        const s = createRtcSession(m.name || 'Manual Peer', m.pkX || '', '', m.sessionId);
-        s.pc.ondatachannel = (e) => setupDataChannel(e.channel, s);
-        await s.pc.setRemoteDescription(new RTCSessionDescription(m.sdp));
-        await s.pc.setLocalDescription(await s.pc.createAnswer()); await waitForIceGathering(s.pc);
-        const pkt = JSON.stringify({ type: 'answer', sessionId: s.sessionId, name: state.identity.name, pkX: state.identity.pkX, sdp: s.pc.localDescription });
-        $('webrtc-local-sdp').value = pkt; $('webrtc-qr-wrap').classList.remove('hidden');
-        QRCode.toCanvas($('webrtc-qr-canvas'), pkt, { width: 112, margin: 1 }, () => {});
-        toast('Answer generated — send to initiator', 'ok');
-      } else if (m.type === 'answer') {
-        const s = state.rtcPeers.get(m.sessionId) || state.pendingManualPc;
-        if (!s) throw new Error('No matching Offer session');
-        s.peerName = m.name || s.peerName; s.peerPkX = m.pkX || s.peerPkX;
-        await s.pc.setRemoteDescription(new RTCSessionDescription(m.sdp));
-        toast('Answer applied — connecting DataChannel...', 'ok');
-      } else throw new Error('Unknown signal type');
-    } catch (err) { toast('Invalid signal JSON: ' + err.message, 'err'); }
-  };
-  $('webrtc-copy-local-btn').onclick = async () => { if ($('webrtc-local-sdp').value) { await navigator.clipboard.writeText($('webrtc-local-sdp').value); toast('Copied signal JSON', 'ok'); } };
 
   async function handleAvatarUpload(file) {
     if (!file) return;
@@ -2562,7 +2409,7 @@ function bindEvents() {
   document.querySelectorAll('.copy-key-btn').forEach(b => { b.onclick = async () => { await navigator.clipboard.writeText($(b.dataset.copyTarget).textContent); toast('Public key copied', 'ok'); }; });
   $('identity-import-card-form').onsubmit = async (e) => {
     e.preventDefault();
-    try { const p = decodeContactCard($('identity-import-card-input').value); upsertPeer(p, true); await persistState(); resubscribeAllRelays(); $('identity-import-card-input').value = ''; renderDmPeers(); renderP2pPanels(); renderCircles(); renderCardsProfileStats(); toast(`Added peer ${p.name}`, 'ok'); }
+    try { const p = decodeContactCard($('identity-import-card-input').value); upsertPeer(p, true); await persistState(); resubscribeAllRelays(); $('identity-import-card-input').value = ''; renderDmPeers(); renderSearchPanels(); renderCircles(); renderCardsProfileStats(); toast(`Added peer ${p.name}`, 'ok'); }
     catch (err) { toast(err.message, 'err'); }
   };
 
@@ -2670,6 +2517,137 @@ function bindEvents() {
   };
 }
 
+async function decryptBackupObject(obj, pass) {
+  if (!obj || obj.format !== 'cipherpost-backup-v1') throw new Error('Invalid format');
+  const { t, m, p } = obj.kdfParams || { t: 2, m: 16384, p: 1 };
+  const key = await argon2idAsync(utf8ToBytes(pass), b64UrlToBytes(obj.salt), { t, m, p, dkLen: 32 });
+  const res = JSON.parse(bytesToUtf8(decryptXChaCha(key, obj.nonce, obj.ciphertext, 'cipherpost-backup-v1')));
+  if (!res.identity?.skEdHex || !res.identity?.skXHex || !res.identity?.skSecpHex) throw new Error('Incomplete backup');
+  return res;
+}
+function parseLinkCodeOrJson(raw) {
+  const t = raw.trim();
+  return t.startsWith('cipherpost:link:') ? JSON.parse(bytesToUtf8(b64UrlToBytes(t.slice('cipherpost:link:'.length)))) : JSON.parse(t);
+}
+
+/* --- AUTH SCREEN (sign in / create account / link device) --- */
+let authBusy = false;
+function setAuthError(msg) {
+  const e = $('auth-error');
+  e.textContent = msg || '';
+  e.classList.toggle('hidden', !msg);
+}
+function setAuthTab(tab) {
+  setAuthError('');
+  document.querySelectorAll('[data-auth-tab]').forEach(b => b.classList.toggle('active', b.dataset.authTab === tab));
+  $('auth-login-form').classList.toggle('hidden', tab !== 'login');
+  $('auth-create-form').classList.toggle('hidden', tab !== 'create');
+  $('auth-link-form').classList.toggle('hidden', tab !== 'link');
+}
+function showAuth(tab) {
+  const meta = state.vaultMeta;
+  const chip = $('auth-account-chip');
+  chip.classList.toggle('hidden', !meta);
+  chip.classList.toggle('flex', Boolean(meta));
+  if (meta) {
+    setAvatar($('auth-account-avatar'), meta.name || 'C', meta.pkEd || '', null);
+    $('auth-account-name').textContent = meta.name || 'Account';
+    $('auth-account-handle').textContent = '@' + (meta.handle || '');
+  }
+  $('auth-login-empty').classList.toggle('hidden', Boolean(meta));
+  $('auth-login-fields').classList.toggle('hidden', !meta);
+  if (state.legacyIdentity && !meta) {
+    $('auth-legacy-note').classList.remove('hidden');
+    $('auth-create-name').value = state.legacyIdentity.name || '';
+    $('auth-create-handle').value = state.legacyIdentity.handle || '';
+  }
+  $('auth-screen').classList.remove('hidden');
+  setAuthTab(tab);
+}
+async function withAuthBusy(btnId, busyText, fn) {
+  if (authBusy) return;
+  authBusy = true;
+  const btn = $(btnId), label = btn.textContent;
+  btn.disabled = true; btn.textContent = busyText; setAuthError('');
+  try { await fn(); }
+  catch (err) { setAuthError(err?.message || 'Something went wrong'); }
+  finally { authBusy = false; btn.disabled = false; btn.textContent = label; }
+}
+async function enterApp() {
+  await persistState();
+  $('auth-screen').classList.add('hidden');
+  await startApp();
+}
+function bindAuthEvents() {
+  document.querySelectorAll('[data-auth-tab]').forEach(b => { b.onclick = () => setAuthTab(b.dataset.authTab); });
+
+  $('auth-login-form').onsubmit = (e) => {
+    e.preventDefault();
+    withAuthBusy('auth-login-btn', 'Unlocking...', async () => {
+      if (!state.vaultMeta) throw new Error('No account on this device. Create an account or link a device.');
+      const ok = await unlockVault($('auth-login-pass').value);
+      if (!ok) throw new Error('Wrong passphrase');
+      state.identity = await kvGetSecure('identity');
+      const circles = await kvGetSecure('circles');
+      if (!state.identity?.skEdHex) throw new Error('Account data is corrupted. Use Link device with a backup.');
+      (circles || []).forEach(c => state.circles.set(c.circleId, c));
+      if (!state.circles.size) { const c = buildCircle('My Private Circle'); state.circles.set(c.circleId, c); }
+      $('auth-login-pass').value = '';
+      await enterApp();
+    });
+  };
+
+  $('auth-create-form').onsubmit = (e) => {
+    e.preventDefault();
+    withAuthBusy('auth-create-btn', 'Creating account...', async () => {
+      const name = $('auth-create-name').value.trim();
+      const handle = $('auth-create-handle').value.trim().replace(/^@/, '');
+      const pass = $('auth-create-pass').value;
+      if (!name) throw new Error('Enter a display name');
+      if (!/^[A-Za-z0-9_]{3,32}$/.test(handle)) throw new Error('Handle must be 3-32 letters, numbers or underscores');
+      if (pass.length < 8) throw new Error('Passphrase must be at least 8 characters');
+      if (pass !== $('auth-create-pass2').value) throw new Error('Passphrases do not match');
+      if (state.vaultMeta && !confirm('An account already exists on this device. Creating a new one will replace it. Continue?')) return;
+      await createVault(pass);
+      const legacy = state.legacyIdentity;
+      state.identity = legacy ? { ...legacy, name, handle } : generateIdentity(name, handle);
+      state.circles.clear();
+      const legacyCircles = legacy ? await kvGet('circles') : null;
+      if (Array.isArray(legacyCircles) && legacyCircles.length) legacyCircles.forEach(c => state.circles.set(c.circleId, c));
+      else { const c = buildCircle('My Private Circle'); state.circles.set(c.circleId, c); }
+      state.legacyIdentity = null;
+      $('auth-create-pass').value = ''; $('auth-create-pass2').value = '';
+      await enterApp();
+    });
+  };
+
+  $('auth-link-form').onsubmit = (e) => {
+    e.preventDefault();
+    withAuthBusy('auth-link-btn', 'Linking...', async () => {
+      const pass = $('auth-link-pass').value;
+      const file = $('auth-link-file').files?.[0];
+      const code = $('auth-link-code').value.trim();
+      if (!file && !code) throw new Error('Paste a Link Code or choose a backup file');
+      let obj;
+      try { obj = file ? JSON.parse(await file.text()) : parseLinkCodeOrJson(code); }
+      catch { throw new Error('That code or file is not a valid CipherPost backup'); }
+      let res;
+      try { res = await decryptBackupObject(obj, pass); }
+      catch { throw new Error('Could not decrypt: wrong passphrase or damaged backup'); }
+      await createVault(pass);
+      state.identity = res.identity;
+      state.circles.clear();
+      (res.circles || []).forEach(c => state.circles.set(c.circleId, c));
+      if (!state.circles.size) { const c = buildCircle('My Private Circle'); state.circles.set(c.circleId, c); }
+      (res.contacts || []).forEach(c => upsertPeer(c, true));
+      (res.following || []).forEach(pk => { if (/^[0-9a-fA-F]{64}$/.test(pk)) state.following.add(pk); });
+      (res.followers || []).forEach(pk => { if (/^[0-9a-fA-F]{64}$/.test(pk)) state.followers.add(pk); });
+      $('auth-link-pass').value = ''; $('auth-link-code').value = ''; $('auth-link-file').value = '';
+      await enterApp();
+    });
+  };
+}
+
 async function bootstrap() {
   state.db = await openDb();
   const savedTheme = await kvGet('theme');
@@ -2678,14 +2656,16 @@ async function bootstrap() {
   if (savedLayout === 'stream' || savedLayout === 'cards') state.pcLayout = savedLayout;
   applyThemeAndLayout();
 
-  const savedId = await kvGet('identity');
-  if (savedId?.skEdHex && savedId?.skXHex && savedId?.skSecpHex) state.identity = savedId;
-  else { state.identity = generateIdentity('Cipher Peer'); await kvSet('identity', state.identity); }
+  const meta = await kvGet('vaultMeta');
+  state.vaultMeta = meta?.salt && meta?.check ? meta : null;
+  const legacy = await kvGet('identity');
+  state.legacyIdentity = (!state.vaultMeta && legacy?.skEdHex && legacy?.skXHex && legacy?.skSecpHex) ? legacy : null;
 
-  const savedCircles = await kvGet('circles');
-  if (Array.isArray(savedCircles) && savedCircles.length) savedCircles.forEach(c => state.circles.set(c.circleId, c));
-  else await createCircle('My Private Circle');
+  bindAuthEvents();
+  showAuth(state.legacyIdentity ? 'create' : 'login');
+}
 
+async function startApp() {
   const savedContacts = await kvGet('contacts');
   if (Array.isArray(savedContacts)) savedContacts.forEach(p => upsertPeer(p, true));
 
@@ -2712,7 +2692,7 @@ async function bootstrap() {
     return { url: r.url, builtin: true, enabled, isLocal: !!r.isLocal, status: r.isLocal && enabled ? 'Connected' : 'Offline', sent: 0, recv: 0, ok: 0, err: 0, retryMs: 3000, ws: null, timer: null };
   });
 
-  bindEvents(); renderIdentitySummary(); renderComposerCircles(); renderCircles(); renderDmPeers(); renderDmMessages(); renderRelayPanels(); renderP2pPanels(); renderSearchPanels();
+  bindEvents(); renderIdentitySummary(); renderComposerCircles(); renderCircles(); renderDmPeers(); renderDmMessages(); renderRelayPanels(); renderSearchPanels(); renderSearchPanels();
   for (const ev of await loadAllEventsFromIdb()) {
     const isCpTagged = Array.isArray(ev?.tags) && ev.tags.some(t => t[0] === 't' && t[1] === 'cipherpost');
     if (!isCpTagged || !isKnownOrLocalSource(ev, 'IndexedDB Cache') || state.deletedPostIds.has(ev.id)) {
@@ -2734,6 +2714,9 @@ async function bootstrap() {
   };
   handleProfileHashRoute();
   window.addEventListener('hashchange', handleProfileHashRoute);
+  const reconnectRelays = () => { if (document.visibilityState === 'visible' && navigator.onLine !== false) { connectAllRelays(); resubscribeAllRelays(); } };
+  window.addEventListener('online', reconnectRelays);
+  document.addEventListener('visibilitychange', reconnectRelays);
 }
 
 bootstrap().catch((err) => toast('Init failed: ' + err.message, 'err'));
