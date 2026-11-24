@@ -1,0 +1,15 @@
+{
+  "appId": "com.abid109.cipherpost",
+  "appName": "CipherPost",
+  "webDir": "dist",
+  "backgroundColor": "#000000",
+  "android": {
+    "allowMixedContent": false
+  },
+  "plugins": {
+    "SystemBars": {
+      "insetsHandling": "css",
+      "initialViewportFitValueHint": "cover"
+    }
+  }
+}
